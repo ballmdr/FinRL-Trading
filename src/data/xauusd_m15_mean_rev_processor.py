@@ -178,29 +178,41 @@ def load_and_prepare_xauusd_m15(
     # Session gate: Asian session (0-8 UTC) or Late NY (18-23 UTC) where Gold mean-reverts reliably
     session_mean_rev_ok = ((session_asia == 1.0) | (session_late_ny == 1.0))
 
-    # 8. Strict Hard Action Mask Gates
-    # Long Gate: Strict Bullish Liquidity Sweep + Oversold (RSI < 40) + Extreme Z-score + ADX < 32 + Session Filter
+    # 8. Causal H1 Multi-Timeframe Trend & Regime Filter
+    # 4 bars of M15 = 1 hour. H1 EMA 50 = span 200, H1 EMA 200 = span 800.
+    h1_ema50 = close.ewm(span=200, adjust=False).mean()
+    h1_ema200 = close.ewm(span=800, adjust=False).mean()
+    h1_kalman_slope = (kf_price - kf_price.shift(8)) / (atr + 1e-8)
+    h1_adx, _, _ = compute_adx(high, low, close, period=56)
+
+    h1_bull = (close > h1_ema50) & (h1_ema50 > h1_ema200) & (h1_kalman_slope > 0.2)
+    h1_bear = (close < h1_ema50) & (h1_ema50 < h1_ema200) & (h1_kalman_slope < -0.2)
+
+    # 9. Strict Hard Action Mask Gates
+    # Long Gate: Bullish Sweep + Oversold + Session Filter + NO Strong H1 Downtrend
     long_gate = (
         (sweep_low == 1.0)
         & (adx < 32.0)
         & (rsi < 40.0)
         & ((zscore_kalman < -1.4) | (zscore_sma20 < -1.5) | (bb_pct < 0.10))
         & session_mean_rev_ok
+        & (~h1_bear)
     ).astype(np.float64)
 
-    # Short Gate: Strict Bearish Liquidity Sweep + Overbought (RSI > 60) + Extreme Z-score + ADX < 32 + Session Filter
+    # Short Gate: Bearish Sweep + Overbought + Session Filter + NO Strong H1 Uptrend
     short_gate = (
         (sweep_high == 1.0)
         & (adx < 32.0)
         & (rsi > 60.0)
         & ((zscore_kalman > 1.4) | (zscore_sma20 > 1.5) | (bb_pct > 0.90))
         & session_mean_rev_ok
+        & (~h1_bull)
     ).astype(np.float64)
 
     print(f"[DataPrep] Total Long Gate Trigger Bars : {long_gate.sum():,.0f} ({long_gate.mean()*100:.2f}%)")
     print(f"[DataPrep] Total Short Gate Trigger Bars: {short_gate.sum():,.0f} ({short_gate.mean()*100:.2f}%)")
 
-    # 9. Assembling Feature Dictionary
+    # 10. Assembling Feature Dictionary
     features_dict = {
         # Raw prices & execution references (Excluded from Observation Vector)
         "open_raw": open_p,
@@ -232,6 +244,11 @@ def load_and_prepare_xauusd_m15(
         "atr_norm": atr / (close + 1e-10) * 1000.0,
         "adx": (adx - 25.0) / 15.0,
         "di_diff": di_diff,
+        # H1 Multi-Timeframe Trend Features
+        "h1_kalman_slope": h1_kalman_slope.clip(-5.0, 5.0),
+        "h1_ema50_dist": ((close - h1_ema50) / (atr + 1e-8)).clip(-5.0, 5.0),
+        "h1_ema200_dist": ((close - h1_ema200) / (atr + 1e-8)).clip(-5.0, 5.0),
+        "h1_adx": (h1_adx - 25.0) / 15.0,
         # Sweeps & Price Action
         "sweep_high": sweep_high,
         "sweep_low": sweep_low,

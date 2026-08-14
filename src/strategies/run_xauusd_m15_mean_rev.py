@@ -139,42 +139,41 @@ def train_and_backtest(
     print(f"   - Val   : {df_val.index[0].date()} -> {df_val.index[-1].date()} ({len(df_val):,} bars)")
     print(f"   - Test  : {df_test.index[0].date()} -> {df_test.index[-1].date()} ({len(df_test):,} bars)")
 
-    # 3. Create Environments (Force-Hold with Trailing Stop)
+    # 3. Create Environments (Fixed Target R:R 1.8x TP / 1.0x SL with H1 Trend Filter)
     train_env = XAUUSDMeanRevEnv(
         df_train,
         window_size=window_size,
         max_steps_per_episode=384,
-        atr_sl_mult=1.2,
+        atr_sl_mult=1.0,
         atr_tp_mult=1.8,
-        trail_trigger_atr=0.8,
-        trail_dist_atr=0.7,
-        max_hold_bars=24,
+        max_hold_bars=36,
         lot_size=0.10,
         initial_capital=10_000.0,
+        exit_policy="fixed_tp_sl",
         is_eval=False,
     )
     val_env = XAUUSDMeanRevEnv(
         df_val,
         window_size=window_size,
-        atr_sl_mult=1.2,
+        max_steps_per_episode=384,
+        atr_sl_mult=1.0,
         atr_tp_mult=1.8,
-        trail_trigger_atr=0.8,
-        trail_dist_atr=0.7,
-        max_hold_bars=24,
+        max_hold_bars=36,
         lot_size=0.10,
         initial_capital=10_000.0,
+        exit_policy="fixed_tp_sl",
         is_eval=True,
     )
     test_env = XAUUSDMeanRevEnv(
         df_test,
         window_size=window_size,
-        atr_sl_mult=1.2,
+        max_steps_per_episode=384,
+        atr_sl_mult=1.0,
         atr_tp_mult=1.8,
-        trail_trigger_atr=0.8,
-        trail_dist_atr=0.7,
-        max_hold_bars=24,
+        max_hold_bars=36,
         lot_size=0.10,
         initial_capital=10_000.0,
+        exit_policy="fixed_tp_sl",
         is_eval=True,
     )
 
