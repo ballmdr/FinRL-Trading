@@ -1,9 +1,9 @@
 """
-XAUUSD M15 Data Processor for Mean Reversion (With Swing / Liquidity Sweep Gates)
----------------------------------------------------------------------------------
+XAUUSD M15 Data Processor for Mean Reversion (Strict Liquidity Sweep + Session Gates)
+-------------------------------------------------------------------------------------
 Loads raw Exness M15 CSV data, applies 1D Kalman filter smoothing,
-computes core mean reversion indicators, swing high/low liquidity sweeps,
-and creates strict hard gates for entry action masking.
+computes core mean reversion indicators, strict 20-bar Swing Liquidity Sweeps,
+and enforces hard Asian + Late NY session gating.
 """
 from __future__ import annotations
 import os
@@ -75,7 +75,7 @@ def load_and_prepare_xauusd_m15(
 ) -> pd.DataFrame:
     """
     Load XAUUSD M15 CSV, clean, generate Kalman and Mean Reversion features,
-    detect Swing High/Low Liquidity Sweeps, and build strict Action Mask gates.
+    detect Strict Swing Liquidity Sweeps, and apply Asian + Late NY Session Gating.
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
@@ -149,13 +149,13 @@ def load_and_prepare_xauusd_m15(
     lower_wick = (np.minimum(open_p, close) - low) / candle_range
     body_ratio = body / candle_range
 
-    # 6. Swing High / Swing Low & Liquidity Sweeps (20-bar lookback)
+    # 6. Swing High / Swing Low & Strict Liquidity Sweeps (20-bar lookback)
     prev_swing_high = high.shift(1).rolling(20, min_periods=5).max()
     prev_swing_low = low.shift(1).rolling(20, min_periods=5).min()
 
-    # Bearish Liquidity Sweep: Price spiked above swing high but closed back below
+    # Bearish Sweep: Spiked above 20-bar swing high but rejected & closed back below
     sweep_high = ((high >= prev_swing_high) & (close < prev_swing_high)).astype(np.float64)
-    # Bullish Liquidity Sweep: Price spiked below swing low but closed back above
+    # Bullish Sweep: Spiked below 20-bar swing low but rejected & closed back above
     sweep_low = ((low <= prev_swing_low) & (close > prev_swing_low)).astype(np.float64)
 
     # 7. Microstructure & Temporal
@@ -173,22 +173,28 @@ def load_and_prepare_xauusd_m15(
     session_asia = ((hour >= 0) & (hour < 8)).astype(np.float64)
     session_london = ((hour >= 8) & (hour < 16)).astype(np.float64)
     session_ny = ((hour >= 13) & (hour < 21)).astype(np.float64)
+    session_late_ny = ((hour >= 18) & (hour < 23)).astype(np.float64)
 
-    # 8. Action Mask / Signal Gates for High-Conviction Mean Reversion Entries
-    # Long Gate: Oversold + Extreme Stretch + Sideway/Non-runaway + Reversal Confirmation
+    # Session gate: Asian session (0-8 UTC) or Late NY (18-23 UTC) where Gold mean-reverts reliably
+    session_mean_rev_ok = ((session_asia == 1.0) | (session_late_ny == 1.0))
+
+    # 8. Strict Hard Action Mask Gates
+    # Long Gate: Strict Bullish Liquidity Sweep + Oversold (RSI < 40) + Extreme Z-score + ADX < 32 + Session Filter
     long_gate = (
-        (adx < 30.0)
-        & (rsi < 36.0)
-        & ((zscore_kalman < -1.6) | (zscore_sma20 < -1.8) | (bb_pct < 0.05))
-        & ((sweep_low == 1.0) | (lower_wick > 0.30) | (close > open_p))
+        (sweep_low == 1.0)
+        & (adx < 32.0)
+        & (rsi < 40.0)
+        & ((zscore_kalman < -1.4) | (zscore_sma20 < -1.5) | (bb_pct < 0.10))
+        & session_mean_rev_ok
     ).astype(np.float64)
 
-    # Short Gate: Overbought + Extreme Stretch + Sideway/Non-runaway + Reversal Confirmation
+    # Short Gate: Strict Bearish Liquidity Sweep + Overbought (RSI > 60) + Extreme Z-score + ADX < 32 + Session Filter
     short_gate = (
-        (adx < 30.0)
-        & (rsi > 64.0)
-        & ((zscore_kalman > 1.6) | (zscore_sma20 > 1.8) | (bb_pct > 0.95))
-        & ((sweep_high == 1.0) | (upper_wick > 0.30) | (close < open_p))
+        (sweep_high == 1.0)
+        & (adx < 32.0)
+        & (rsi > 60.0)
+        & ((zscore_kalman > 1.4) | (zscore_sma20 > 1.5) | (bb_pct > 0.90))
+        & session_mean_rev_ok
     ).astype(np.float64)
 
     print(f"[DataPrep] Total Long Gate Trigger Bars : {long_gate.sum():,.0f} ({long_gate.mean()*100:.2f}%)")

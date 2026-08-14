@@ -58,11 +58,10 @@ class DifferentialSharpeReward:
 class MeanReversionRewardCalculator:
     """
     Composite reward calculator combining:
-    1. Incremental PnL (normalized by ATR)
+    1. Incremental Step PnL (normalized by ATR)
     2. Differential Sharpe component
-    3. Transaction cost / Spread friction
+    3. Transaction cost / Spread friction (round-trip)
     4. Adverse Excursion (Drawdown breakout) penalty
-    5. Holding time friction
     """
 
     def __init__(
@@ -73,7 +72,7 @@ class MeanReversionRewardCalculator:
         spread_penalty_mult: float = 1.0,
         adverse_mdd_threshold_atr: float = 1.5,
         adverse_penalty_scale: float = 0.5,
-        step_hold_penalty: float = 0.002,
+        step_hold_penalty: float = 0.0,  # Zero by default: do not penalize holding!
     ):
         self.use_differential_sharpe = use_differential_sharpe
         self.sharpe_weight = sharpe_weight
@@ -112,14 +111,13 @@ class MeanReversionRewardCalculator:
             cost_penalty = -(turnover_cost / atr)
 
         # 3. Adverse Excursion / Runaway Drawdown Penalty
-        # If holding a losing position that moves against us by more than threshold ATR
         adverse_penalty = 0.0
         unrealized_loss_atr = -unrealized_pnl_raw / atr
         if unrealized_loss_atr > self.adverse_mdd_threshold_atr:
             excess_loss = unrealized_loss_atr - self.adverse_mdd_threshold_atr
             adverse_penalty = -self.adverse_penalty_scale * (excess_loss ** 1.5)
 
-        # 4. Holding time penalty (discourage idle holding)
+        # 4. Holding time penalty (0.0 to let trades play out to target)
         hold_penalty = -self.step_hold_penalty if is_holding else 0.0
 
         # 5. Differential Sharpe

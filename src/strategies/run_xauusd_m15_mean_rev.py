@@ -1,8 +1,8 @@
 """
-Unified Training and Backtesting Pipeline for XAUUSD M15 Mean Reversion (With Action Masking)
----------------------------------------------------------------------------------------------
-Executes Kalman-enhanced data preparation with Swing Sweeps, Dueling DDQN agent training,
-validation evaluation, and out-of-sample backtesting with realistic money management.
+Unified Training and Backtesting Pipeline for XAUUSD M15 Mean Reversion
+-----------------------------------------------------------------------
+Executes Strict Sweep Gating, Force-Hold Execution, Trailing Stop,
+and selects the best model checkpoint based on Validation Profit Factor & Net PnL.
 """
 from __future__ import annotations
 import os
@@ -22,7 +22,9 @@ def calculate_quant_metrics(equity_series: pd.Series, trades: list[dict], initia
     """Calculate professional quantitative trading performance metrics on real dollar equity."""
     returns = equity_series.pct_change().dropna()
 
-    total_return = ((equity_series.iloc[-1] - initial_capital) / initial_capital) * 100.0
+    ending_capital = float(equity_series.iloc[-1])
+    net_pnl_dollar = ending_capital - initial_capital
+    total_return = (net_pnl_dollar / initial_capital) * 100.0
 
     # Annualization factor for M15 (252 trading days * 96 15-min bars/day = 24,192 bars/year)
     ann_factor = np.sqrt(24192)
@@ -62,7 +64,8 @@ def calculate_quant_metrics(equity_series: pd.Series, trades: list[dict], initia
 
     return {
         "Initial Capital ($)": initial_capital,
-        "Ending Capital ($)": float(equity_series.iloc[-1]),
+        "Ending Capital ($)": ending_capital,
+        "Net P&L ($)": net_pnl_dollar,
         "Total Return (%)": total_return,
         "Annualized Sharpe": sharpe,
         "Sortino Ratio": sortino,
@@ -117,7 +120,7 @@ def train_and_backtest(
     os.makedirs(reports_dir, exist_ok=True)
 
     print("=" * 75)
-    print("🚀 Starting XAUUSD M15 Gated Mean Reversion DRL Pipeline (Action Masked)")
+    print("🚀 Starting XAUUSD M15 Strict-Gated Mean Reversion DRL Pipeline (Force-Hold)")
     print("=" * 75)
 
     # 1. Load and process data
@@ -136,15 +139,16 @@ def train_and_backtest(
     print(f"   - Val   : {df_val.index[0].date()} -> {df_val.index[-1].date()} ({len(df_val):,} bars)")
     print(f"   - Test  : {df_test.index[0].date()} -> {df_test.index[-1].date()} ({len(df_test):,} bars)")
 
-    # 3. Create Environments
+    # 3. Create Environments (Force-Hold with Trailing Stop)
     train_env = XAUUSDMeanRevEnv(
         df_train,
         window_size=window_size,
         max_steps_per_episode=384,
         atr_sl_mult=1.2,
         atr_tp_mult=1.8,
-        max_hold_bars=20,
-        min_hold_bars=2,
+        trail_trigger_atr=0.8,
+        trail_dist_atr=0.7,
+        max_hold_bars=24,
         lot_size=0.10,
         initial_capital=10_000.0,
         is_eval=False,
@@ -154,8 +158,9 @@ def train_and_backtest(
         window_size=window_size,
         atr_sl_mult=1.2,
         atr_tp_mult=1.8,
-        max_hold_bars=20,
-        min_hold_bars=2,
+        trail_trigger_atr=0.8,
+        trail_dist_atr=0.7,
+        max_hold_bars=24,
         lot_size=0.10,
         initial_capital=10_000.0,
         is_eval=True,
@@ -165,8 +170,9 @@ def train_and_backtest(
         window_size=window_size,
         atr_sl_mult=1.2,
         atr_tp_mult=1.8,
-        max_hold_bars=20,
-        min_hold_bars=2,
+        trail_trigger_atr=0.8,
+        trail_dist_atr=0.7,
+        max_hold_bars=24,
         lot_size=0.10,
         initial_capital=10_000.0,
         is_eval=True,
@@ -189,12 +195,12 @@ def train_and_backtest(
         batch_size=batch_size,
     )
 
-    print(f"\n🧠 Initialized Dueling DDQN Agent with Action Masking (State Dim: {state_dim}, Action Dim: {action_dim})")
-    print(f"🏋️ Training for {total_timesteps:,} steps with periodic validation...\n")
+    print(f"\n🧠 Initialized Dueling DDQN Agent (State Dim: {state_dim}, Action Dim: {action_dim})")
+    print(f"🏋️ Training for {total_timesteps:,} steps with Net PnL/Profit Factor validation...\n")
 
     # 5. Training Loop
-    best_val_reward = -np.inf
-    best_model_path = os.path.join(models_dir, "xauusd_m15_mean_rev_gated_best.pt")
+    best_score = -np.inf
+    best_model_path = os.path.join(models_dir, "xauusd_m15_mean_rev_force_hold_best.pt")
 
     step = 0
     episodes = 0
@@ -224,22 +230,27 @@ def train_and_backtest(
                 val_metrics = calculate_quant_metrics(val_equity, val_trades, initial_capital=10_000.0)
                 elapsed = time.time() - start_time
 
+                # Checkpoint Score: Balance Profit Factor, Return, and Trade Count
+                pf = val_metrics["Profit Factor"]
+                ret = val_metrics["Total Return (%)"]
+                trades_cnt = val_metrics["Total Trades"]
+                score = (pf * 10.0) + ret if trades_cnt >= 15 else (pf - 10.0)
+
                 print(
                     f"Step [{step:6d}/{total_timesteps:6d}] | "
                     f"Eps: {agent.epsilon:.3f} | "
-                    f"Val Reward: {val_reward:7.2f} | "
-                    f"Return: {val_metrics['Total Return (%)']:+6.2f}% | "
-                    f"Sharpe: {val_metrics['Annualized Sharpe']:+5.2f} | "
-                    f"Trades: {val_metrics['Total Trades']:3d} | "
+                    f"Net PnL: ${val_metrics['Net P&L ($)']:+7.2f} | "
+                    f"Return: {ret:+6.2f}% | "
+                    f"PF: {pf:4.2f} | "
                     f"WR: {val_metrics['Win Rate (%)']:4.1f}% | "
-                    f"PF: {val_metrics['Profit Factor']:4.2f} | "
+                    f"Trades: {trades_cnt:3d} | "
                     f"Time: {elapsed:4.0f}s"
                 )
 
-                if val_reward > best_val_reward:
-                    best_val_reward = val_reward
+                if score > best_score:
+                    best_score = score
                     agent.save(best_model_path)
-                    print(f"  ⭐ Saved new best model checkpoint to {best_model_path}")
+                    print(f"  ⭐ Saved new best checkpoint (PF: {pf:.2f}, Return: {ret:+.2f}%, Trades: {trades_cnt}) to {best_model_path}")
 
         episodes += 1
 
@@ -260,7 +271,7 @@ def train_and_backtest(
 
     for k, v in test_metrics.items():
         if isinstance(v, float):
-            print(f"  {k:25s}: {v:+10.2f}" if ("Return" in k or "Sharpe" in k or "Drawdown" in k or "Profit" in k or "Loss" in k or "Capital" in k) else f"  {k:25s}: {v:10.2f}")
+            print(f"  {k:25s}: {v:+10.2f}" if ("Return" in k or "Sharpe" in k or "Drawdown" in k or "Profit" in k or "Loss" in k or "Capital" in k or "P&L" in k) else f"  {k:25s}: {v:10.2f}")
         else:
             print(f"  {k:25s}: {v:10d}")
 
@@ -278,7 +289,7 @@ def train_and_backtest(
     # Equity Curve
     ax1.plot(test_equity.index, test_equity.values, label="Kalman Mean-Rev DRL Strategy ($10k Base)", color="#00ff88", linewidth=1.8)
     ax1.axhline(10_000.0, color="#888888", linestyle="--", alpha=0.6, label="Starting Capital ($10,000)")
-    ax1.set_title("XAUUSD M15 Out-of-Sample Performance (Action-Masked Dueling DDQN)", fontsize=14, fontweight="bold")
+    ax1.set_title("XAUUSD M15 Out-of-Sample Performance (Force-Hold + Trailing Stop DDQN)", fontsize=14, fontweight="bold")
     ax1.set_ylabel("Portfolio Equity ($)", fontsize=12)
     ax1.grid(True, linestyle="--", alpha=0.5)
     ax1.legend(loc="upper left")
@@ -293,7 +304,7 @@ def train_and_backtest(
     ax2.legend(loc="lower left")
 
     plt.tight_layout()
-    chart_path = os.path.join(reports_dir, "xauusd_m15_mean_rev_gated_backtest.png")
+    chart_path = os.path.join(reports_dir, "xauusd_m15_mean_rev_force_hold_backtest.png")
     plt.savefig(chart_path, dpi=200)
     plt.close()
 

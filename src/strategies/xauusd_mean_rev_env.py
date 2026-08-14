@@ -1,9 +1,15 @@
 """
-XAUUSD M15 Mean Reversion Trading Environment (With Action Masking)
--------------------------------------------------------------------
-Custom Gymnasium environment for XAUUSD Forex/CFD trading with
-hard signal gates (Swing sweeps + Extreme Z-scores + ADX regime),
-realistic 0.10 lot sizing, ATR Stop Loss / Take Profit, and Differential Sharpe reward.
+XAUUSD M15 Mean Reversion Trading Environment (Multi-Arm Exit Policies)
+-----------------------------------------------------------------------
+Custom Gymnasium environment for XAUUSD Forex/CFD supporting:
+1. Strict Action Masking at entry (Liquidity Sweep + Session Gating).
+2. Modular Exit Policies:
+   - 'be_then_trail': Breakeven at +1.0x ATR, Trail at +1.4x ATR (0.5x trail dist), TP 1.8x ATR.
+   - 'mean_target': Exit on reversion to Kalman Dynamic Mean (kf_price) / BB Midline or Opposite Sweep.
+   - 'agent_after_1atr': Force-hold until profit >= +1.0x ATR, then allow agent discretionary exit.
+   - 'fixed_tp_sl': Pure TP (1.8x ATR) / SL (1.0x ATR) without early scratch.
+3. Exact step-by-step incremental PnL accounting (zero double counting).
+4. Full round-trip spread deduction on real $10,000 equity (0.10 lot sizing).
 """
 from __future__ import annotations
 import numpy as np
@@ -16,15 +22,7 @@ from src.strategies.mean_rev_reward import MeanReversionRewardCalculator
 
 class XAUUSDMeanRevEnv(gym.Env):
     """
-    Gymnasium Trading Environment for XAUUSD M15 Mean Reversion with Action Masking.
-
-    Action Space:
-        0: Flat / Close Position
-        1: Long (Buy) — Gate: Z < -1.6, ADX < 30, RSI < 36, Sweep Low / Rejection
-        2: Short (Sell) — Gate: Z > +1.6, ADX < 30, RSI > 64, Sweep High / Rejection
-
-    Observation Space:
-        Flattened array of [window_size x n_features] + [4 portfolio context features]
+    Gymnasium Trading Environment for XAUUSD M15 Mean Reversion with Modular Exit Policies.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -34,11 +32,14 @@ class XAUUSDMeanRevEnv(gym.Env):
         df: pd.DataFrame,
         window_size: int = 12,
         max_steps_per_episode: int = 400,
-        atr_sl_mult: float = 1.2,
-        atr_tp_mult: float = 1.8,
-        max_hold_bars: int = 20,
-        min_hold_bars: int = 2,
-        lot_size: float = 0.10,  # 0.10 lot = 10 oz ($10 per $1.00 gold move)
+        exit_policy: str = "be_then_trail",  # 'be_then_trail' | 'mean_target' | 'agent_after_1atr' | 'fixed_tp_sl'
+        atr_sl_mult: float = 1.0,            # Tight SL at 1.0x ATR
+        atr_tp_mult: float = 1.8,            # Target TP at 1.8x ATR
+        be_trigger_atr: float = 1.0,         # Lock Breakeven (+0.1x ATR) when profit >= 1.0x ATR
+        trail_trigger_atr: float = 1.4,      # Start trailing only when profit >= 1.4x ATR
+        trail_dist_atr: float = 0.5,         # Trail distance behind peak price
+        max_hold_bars: int = 32,             # Max 8 hours hold
+        lot_size: float = 0.10,              # 0.10 lot = $10 per $1.00 Gold move
         initial_capital: float = 10_000.0,
         reward_calculator: MeanReversionRewardCalculator | None = None,
         is_eval: bool = False,
@@ -47,15 +48,18 @@ class XAUUSDMeanRevEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.window_size = window_size
         self.max_steps = max_steps_per_episode
+        self.exit_policy = exit_policy
         self.atr_sl_mult = atr_sl_mult
         self.atr_tp_mult = atr_tp_mult
+        self.be_trigger_atr = be_trigger_atr
+        self.trail_trigger_atr = trail_trigger_atr
+        self.trail_dist_atr = trail_dist_atr
         self.max_hold_bars = max_hold_bars
-        self.min_hold_bars = min_hold_bars
         self.lot_size = lot_size
         self.initial_capital = initial_capital
         self.is_eval = is_eval
 
-        # Separate raw columns from model observation features
+        # Separate raw price columns from model observation features
         self.raw_cols = {
             "open_raw", "high_raw", "low_raw", "close_raw",
             "atr_raw", "spread_raw", "kf_price_raw",
@@ -72,6 +76,7 @@ class XAUUSDMeanRevEnv(gym.Env):
         self.close_np = df["close_raw"].values.astype(np.float64)
         self.atr_np = df["atr_raw"].values.astype(np.float64)
         self.spread_np = df["spread_raw"].values.astype(np.float64)
+        self.kf_price_np = df["kf_price_raw"].values.astype(np.float64)
         self.long_gate_np = df["long_gate_raw"].values.astype(np.float32)
         self.short_gate_np = df["short_gate_raw"].values.astype(np.float32)
 
@@ -83,9 +88,9 @@ class XAUUSDMeanRevEnv(gym.Env):
         self.action_space = spaces.Discrete(3)
 
         self.reward_calc = reward_calculator or MeanReversionRewardCalculator(
-            spread_penalty_mult=1.5,
-            adverse_penalty_scale=1.0,
-            step_hold_penalty=0.001,
+            spread_penalty_mult=1.0,
+            adverse_penalty_scale=0.8,
+            step_hold_penalty=0.0,
         )
         self.np_random = np.random.RandomState()
         self._reset_state()
@@ -110,6 +115,9 @@ class XAUUSDMeanRevEnv(gym.Env):
         self.entry_price = 0.0
         self.sl_price = 0.0
         self.tp_price = 0.0
+        self.peak_price = 0.0
+        self.be_active = False
+        self.trailing_active = False
         self.hold_bars = 0
         self.prev_unrealized_pnl = 0.0
 
@@ -126,23 +134,30 @@ class XAUUSDMeanRevEnv(gym.Env):
         return self._get_obs(), {"action_mask": self.action_masks()}
 
     def action_masks(self) -> np.ndarray:
-        """
-        Action mask defining valid transitions at current bar:
-        - Flat (0): Always valid.
-        - Long (1): Valid if long_gate is active (or currently holding Long).
-        - Short (2): Valid if short_gate is active (or currently holding Short).
-        """
+        """Action mask defining valid transitions at current bar."""
         can_long = bool(self.long_gate_np[self.current_step] > 0.5)
         can_short = bool(self.short_gate_np[self.current_step] > 0.5)
 
         if self.position == 0:
             return np.array([True, can_long, can_short], dtype=bool)
         elif self.position == 1:
-            # In Long: can close (0), keep holding (1), or flip to Short if short_gate is active
-            return np.array([True, True, can_short], dtype=bool)
+            if self.exit_policy == "agent_after_1atr":
+                # Can exit only after profit >= 1.0x ATR
+                p = self.close_np[self.current_step]
+                atr = max(self.atr_np[self.current_step], 1e-4)
+                can_exit = bool((p - self.entry_price) >= 1.0 * atr)
+                return np.array([can_exit, True, False], dtype=bool)
+            else:
+                # Force-hold
+                return np.array([False, True, False], dtype=bool)
         else:  # In Short
-            # In Short: can close (0), flip to Long if long_gate is active, or keep holding (2)
-            return np.array([True, can_long, True], dtype=bool)
+            if self.exit_policy == "agent_after_1atr":
+                p = self.close_np[self.current_step]
+                atr = max(self.atr_np[self.current_step], 1e-4)
+                can_exit = bool((self.entry_price - p) >= 1.0 * atr)
+                return np.array([can_exit, False, True], dtype=bool)
+            else:
+                return np.array([False, False, True], dtype=bool)
 
     def _get_obs(self) -> np.ndarray:
         window_feats = self.features_np[
@@ -172,117 +187,182 @@ class XAUUSDMeanRevEnv(gym.Env):
         return np.concatenate([window_feats, portfolio_ctx]).astype(np.float32)
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
-        # Enforce Action Masking
-        mask = self.action_masks()
-        if not mask[action]:
-            # Invalid action: stay flat or hold position
-            action = 0 if self.position == 0 else (1 if self.position == 1 else 2)
-
-        target_pos = 0 if action == 0 else (1 if action == 1 else -1)
-
         curr_close = self.close_np[self.current_step]
         curr_high = self.high_np[self.current_step]
         curr_low = self.low_np[self.current_step]
         curr_atr = max(self.atr_np[self.current_step], 1e-4)
         curr_spread = self.spread_np[self.current_step]
+        curr_kf = self.kf_price_np[self.current_step]
 
         realized_pnl_step = 0.0
         exit_reason = None
+        pos_change = 0.0
+        delta_pnl_total = 0.0
 
-        # 1. SL / TP / Max Hold logic for existing position
+        # 1. Existing Position Management
         if self.position != 0:
             self.hold_bars += 1
 
             if self.position == 1:  # Long
-                if curr_low <= self.sl_price:
-                    realized_pnl_step = self.sl_price - self.entry_price
-                    exit_reason = "SL"
-                    target_pos = 0
-                elif curr_high >= self.tp_price:
-                    realized_pnl_step = self.tp_price - self.entry_price
-                    exit_reason = "TP"
-                    target_pos = 0
-                elif self.hold_bars >= self.max_hold_bars:
-                    realized_pnl_step = curr_close - self.entry_price
-                    exit_reason = "MAX_HOLD"
-                    target_pos = 0
+                self.peak_price = max(self.peak_price, curr_high)
+                unrealized_profit_atr = (self.peak_price - self.entry_price) / curr_atr
+
+                # Policy: BE-then-Trail
+                if self.exit_policy == "be_then_trail":
+                    # Lock Breakeven (+0.1x ATR) at +1.0x ATR profit
+                    if not self.be_active and unrealized_profit_atr >= self.be_trigger_atr:
+                        self.be_active = True
+                        self.sl_price = max(self.sl_price, self.entry_price + 0.1 * curr_atr)
+
+                    # Start trailing at +1.4x ATR profit
+                    if not self.trailing_active and unrealized_profit_atr >= self.trail_trigger_atr:
+                        self.trailing_active = True
+
+                    if self.trailing_active:
+                        new_sl = self.peak_price - (self.trail_dist_atr * curr_atr)
+                        self.sl_price = max(self.sl_price, new_sl)
+
+                # Policy: Dynamic Mean Target Exit
+                elif self.exit_policy == "mean_target":
+                    # Exit when price crosses back above Kalman Mean or reaches TP
+                    if curr_close >= curr_kf and (curr_close - self.entry_price) >= 0.5 * curr_atr:
+                        exit_price = curr_close - 0.5 * curr_spread
+                        trade_realized_pnl = exit_price - self.entry_price
+                        exit_reason = "MEAN_REVERTED"
+
+                # Check Exits across all policies
+                if exit_reason is None:
+                    if curr_high >= self.tp_price:
+                        exit_price = self.tp_price - 0.5 * curr_spread
+                        trade_realized_pnl = exit_price - self.entry_price
+                        exit_reason = "TP"
+                    elif curr_low <= self.sl_price:
+                        exit_price = self.sl_price - 0.5 * curr_spread
+                        trade_realized_pnl = exit_price - self.entry_price
+                        exit_reason = "TRAILING_STOP" if self.trailing_active else ("BE_STOP" if self.be_active else "SL")
+                    elif self.exit_policy == "agent_after_1atr" and action == 0 and (curr_close - self.entry_price) >= 1.0 * curr_atr:
+                        exit_price = curr_close - 0.5 * curr_spread
+                        trade_realized_pnl = exit_price - self.entry_price
+                        exit_reason = "AGENT_EXIT"
+                    elif self.hold_bars >= self.max_hold_bars:
+                        exit_price = curr_close - 0.5 * curr_spread
+                        trade_realized_pnl = exit_price - self.entry_price
+                        exit_reason = "MAX_HOLD"
 
             elif self.position == -1:  # Short
-                if curr_high >= self.sl_price:
-                    realized_pnl_step = self.entry_price - self.sl_price
-                    exit_reason = "SL"
-                    target_pos = 0
-                elif curr_low <= self.tp_price:
-                    realized_pnl_step = self.entry_price - self.tp_price
-                    exit_reason = "TP"
-                    target_pos = 0
-                elif self.hold_bars >= self.max_hold_bars:
-                    realized_pnl_step = self.entry_price - curr_close
-                    exit_reason = "MAX_HOLD"
-                    target_pos = 0
+                self.peak_price = min(self.peak_price, curr_low)
+                unrealized_profit_atr = (self.entry_price - self.peak_price) / curr_atr
 
-        # Prevent early close before min_hold_bars unless SL/TP hit
-        if self.position != 0 and exit_reason is None and target_pos == 0:
-            if self.hold_bars < self.min_hold_bars:
-                target_pos = self.position  # keep holding
+                # Policy: BE-then-Trail
+                if self.exit_policy == "be_then_trail":
+                    if not self.be_active and unrealized_profit_atr >= self.be_trigger_atr:
+                        self.be_active = True
+                        self.sl_price = min(self.sl_price, self.entry_price - 0.1 * curr_atr)
 
-        # 2. Position Transitions
-        pos_change = abs(target_pos - self.position)
+                    if not self.trailing_active and unrealized_profit_atr >= self.trail_trigger_atr:
+                        self.trailing_active = True
 
-        if pos_change > 0:
-            # If closing manually without SL/TP
-            if self.position != 0 and exit_reason is None:
-                if self.position == 1:
-                    realized_pnl_step = curr_close - self.entry_price
-                else:
-                    realized_pnl_step = self.entry_price - curr_close
-                exit_reason = "MANUAL_CLOSE"
+                    if self.trailing_active:
+                        new_sl = self.peak_price + (self.trail_dist_atr * curr_atr)
+                        self.sl_price = min(self.sl_price, new_sl)
 
+                # Policy: Dynamic Mean Target Exit
+                elif self.exit_policy == "mean_target":
+                    if curr_close <= curr_kf and (self.entry_price - curr_close) >= 0.5 * curr_atr:
+                        exit_price = curr_close + 0.5 * curr_spread
+                        trade_realized_pnl = self.entry_price - exit_price
+                        exit_reason = "MEAN_REVERTED"
+
+                # Check Exits across all policies
+                if exit_reason is None:
+                    if curr_low <= self.tp_price:
+                        exit_price = self.tp_price + 0.5 * curr_spread
+                        trade_realized_pnl = self.entry_price - exit_price
+                        exit_reason = "TP"
+                    elif curr_high >= self.sl_price:
+                        exit_price = self.sl_price + 0.5 * curr_spread
+                        trade_realized_pnl = self.entry_price - exit_price
+                        exit_reason = "TRAILING_STOP" if self.trailing_active else ("BE_STOP" if self.be_active else "SL")
+                    elif self.exit_policy == "agent_after_1atr" and action == 0 and (self.entry_price - curr_close) >= 1.0 * curr_atr:
+                        exit_price = curr_close + 0.5 * curr_spread
+                        trade_realized_pnl = self.entry_price - exit_price
+                        exit_reason = "AGENT_EXIT"
+                    elif self.hold_bars >= self.max_hold_bars:
+                        exit_price = curr_close + 0.5 * curr_spread
+                        trade_realized_pnl = self.entry_price - exit_price
+                        exit_reason = "MAX_HOLD"
+
+            # 2. Process Exit Execution & Exact Incremental PnL
             if exit_reason is not None:
-                dollar_pnl = realized_pnl_step * (self.lot_size * 100.0)  # 0.1 lot = $10/pt
+                delta_pnl_total = trade_realized_pnl - self.prev_unrealized_pnl
+                realized_dollar = trade_realized_pnl * (self.lot_size * 100.0)
+
                 self.trades_history.append(
                     {
                         "step": self.current_step,
                         "position": self.position,
                         "entry": self.entry_price,
-                        "exit": curr_close,
-                        "pnl_price": realized_pnl_step,
-                        "pnl_dollar": dollar_pnl,
-                        "pnl_atr": realized_pnl_step / curr_atr,
+                        "exit": exit_price,
+                        "pnl_price": trade_realized_pnl,
+                        "pnl_dollar": realized_dollar,
+                        "pnl_atr": trade_realized_pnl / curr_atr,
                         "hold_bars": self.hold_bars,
                         "reason": exit_reason,
                     }
                 )
-                self.realized_pnl_total += dollar_pnl
+
+                self.realized_pnl_total += realized_dollar
                 self.position = 0
                 self.hold_bars = 0
+                self.be_active = False
+                self.trailing_active = False
                 self.prev_unrealized_pnl = 0.0
+                pos_change = 1.0
+                unrealized_pnl_price = 0.0
+            else:
+                if self.position == 1:
+                    unrealized_pnl_price = (curr_close - 0.5 * curr_spread) - self.entry_price
+                else:
+                    unrealized_pnl_price = self.entry_price - (curr_close + 0.5 * curr_spread)
 
-            # Open new position
+                delta_pnl_total = unrealized_pnl_price - self.prev_unrealized_pnl
+                self.prev_unrealized_pnl = unrealized_pnl_price
+
+        # 3. New Entry Execution (Only when Flat)
+        elif self.position == 0:
+            mask = self.action_masks()
+            target_pos = 0
+            if action == 1 and mask[1]:
+                target_pos = 1
+            elif action == 2 and mask[2]:
+                target_pos = -1
+
             if target_pos != 0:
                 self.position = target_pos
                 self.hold_bars = 0
-                if target_pos == 1:  # Long (Ask)
+                self.be_active = False
+                self.trailing_active = False
+                pos_change = 1.0
+
+                if target_pos == 1:  # Long
                     self.entry_price = curr_close + 0.5 * curr_spread
+                    self.peak_price = curr_high
                     self.sl_price = self.entry_price - (self.atr_sl_mult * curr_atr)
                     self.tp_price = self.entry_price + (self.atr_tp_mult * curr_atr)
-                else:  # Short (Bid)
+                    unrealized_pnl_price = -curr_spread
+                else:  # Short
                     self.entry_price = curr_close - 0.5 * curr_spread
+                    self.peak_price = curr_low
                     self.sl_price = self.entry_price + (self.atr_sl_mult * curr_atr)
                     self.tp_price = self.entry_price - (self.atr_tp_mult * curr_atr)
+                    unrealized_pnl_price = -curr_spread
 
-        # 3. Compute Unrealized PnL
-        unrealized_pnl_price = 0.0
-        if self.position == 1:
-            unrealized_pnl_price = curr_close - self.entry_price
-        elif self.position == -1:
-            unrealized_pnl_price = self.entry_price - curr_close
-
-        unrealized_dollar = unrealized_pnl_price * (self.lot_size * 100.0)
-        delta_unrealized = unrealized_pnl_price - self.prev_unrealized_pnl
-        self.prev_unrealized_pnl = unrealized_pnl_price
-
-        delta_pnl_total = realized_pnl_step + delta_unrealized
+                delta_pnl_total = unrealized_pnl_price
+                self.prev_unrealized_pnl = unrealized_pnl_price
+            else:
+                unrealized_pnl_price = 0.0
+                delta_pnl_total = 0.0
+                self.prev_unrealized_pnl = 0.0
 
         # 4. Calculate Shaped Reward
         reward, rew_info = self.reward_calc.calculate(
@@ -294,7 +374,6 @@ class XAUUSDMeanRevEnv(gym.Env):
             is_holding=(self.position != 0),
         )
 
-        # Advance step
         self.current_step += 1
         self.step_count += 1
 
@@ -302,14 +381,13 @@ class XAUUSDMeanRevEnv(gym.Env):
         truncated = False
 
         obs = self._get_obs() if not terminated else np.zeros(self.observation_space.shape, dtype=np.float32)
+        unrealized_dollar = unrealized_pnl_price * (self.lot_size * 100.0)
 
         info = {
             "step": self.current_step,
-            "realized_pnl_step": realized_pnl_step,
             "realized_pnl_total": self.realized_pnl_total,
             "unrealized_dollar": unrealized_dollar,
             "position": self.position,
-            "pos_change": pos_change,
             "reward_breakdown": rew_info,
             "trades_count": len(self.trades_history),
             "action_mask": self.action_masks(),
