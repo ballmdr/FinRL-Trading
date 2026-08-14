@@ -41,7 +41,7 @@ sqlalchemy>=2.0.0
 pathlib>=1.0.1
 typing-extensions>=4.8.0
 lxml>=4.9.0  # For pandas.read_html
-finnhub>=2.4.19
+finnhub-python>=2.4.19
 
 # Development and testing
 pytest>=7.4.0
